@@ -3,18 +3,20 @@ import axios from 'axios';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { exec } from 'child_process';
-import { promisify } from 'util';
+import {
+    spawn,
+    ChildProcess
+} from 'child_process';
 
-const execAsync = promisify(exec);
-
-// ------------------------------------------------------------
+// ============================================================
 // Types
-// ------------------------------------------------------------
+// ============================================================
 
 interface ToolCall {
     id: string;
+
     type: 'function';
+
     function: {
         name: string;
         arguments: string;
@@ -22,533 +24,1915 @@ interface ToolCall {
 }
 
 interface ChatMessage {
-    role: 'system' | 'user' | 'assistant' | 'tool';
-    content: string | null;
-    tool_calls?: ToolCall[];
-    tool_call_id?: string;
+    role:
+        | 'user'
+        | 'assistant'
+        | 'tool';
+
+    content:
+        string | null;
+
+    tool_calls?:
+        ToolCall[];
+
+    tool_call_id?:
+        string;
 }
 
 interface ChatSession {
-    id: string;
-    title: string;
-    messages: ChatMessage[];
-    updatedAt: number;
+    id:
+        string;
+
+    title:
+        string;
+
+    messages:
+        ChatMessage[];
+
+    updatedAt:
+        number;
 }
 
-const STORAGE_KEY = 'myAiCoder.sessions';
-const MAX_TITLE_LENGTH = 50;
-const MAX_TOOL_ROUNDS = 10;
-const MAX_TOOL_OUTPUT_CHARS = 8000;
+interface ActivityItem {
+    id:
+        string;
 
-// ------------------------------------------------------------
-// Tool definitions sent to the model (OpenAI function-calling format)
-// ------------------------------------------------------------
+    type:
+        | 'status'
+        | 'tool'
+        | 'terminal'
+        | 'file'
+        | 'result'
+        | 'error';
+
+    title:
+        string;
+
+    detail?:
+        string;
+
+    status?:
+        | 'running'
+        | 'completed'
+        | 'failed'
+        | 'info';
+
+    toolName?:
+        string;
+
+    args?:
+        any;
+
+    timestamp:
+        number;
+}
+
+interface AgentState {
+    running:
+        boolean;
+
+    stopped:
+        boolean;
+
+    activities:
+        ActivityItem[];
+}
+
+// ============================================================
+// Storage
+// ============================================================
+
+const STORAGE_KEY =
+    'myAiCoder.sessions';
+
+const API_URL =
+    'http://127.0.0.1:8000/chat';
+
+// ============================================================
+// Tools
+// ============================================================
 
 const TOOLS = [
     {
         type: 'function',
+
         function: {
             name: 'read_file',
-            description: 'Read the text contents of a file. Path may be absolute or relative to the workspace root.',
+
+            description:
+                'Read the complete text contents of a file. Path may be absolute or relative to the workspace root.',
+
             parameters: {
                 type: 'object',
+
                 properties: {
-                    path: { type: 'string', description: 'Absolute or workspace-relative file path' }
+                    path: {
+                        type: 'string',
+                        description:
+                            'Absolute or workspace-relative file path'
+                    }
                 },
-                required: ['path']
+
+                required: [
+                    'path'
+                ]
             }
         }
     },
+
     {
         type: 'function',
+
         function: {
             name: 'write_file',
-            description: 'Create or overwrite a file with the given content. Creates parent folders if needed.',
+
+            description:
+                'Create or completely overwrite a file with the supplied content. Creates parent directories when necessary.',
+
             parameters: {
                 type: 'object',
+
                 properties: {
-                    path: { type: 'string', description: 'Absolute or workspace-relative file path' },
-                    content: { type: 'string', description: 'Full new content of the file' }
+                    path: {
+                        type: 'string',
+                        description:
+                            'Absolute or workspace-relative file path'
+                    },
+
+                    content: {
+                        type: 'string',
+                        description:
+                            'Complete new file content'
+                    }
                 },
-                required: ['path', 'content']
+
+                required: [
+                    'path',
+                    'content'
+                ]
             }
         }
     },
+
     {
         type: 'function',
+
         function: {
             name: 'list_directory',
-            description: 'List files and subfolders inside a directory.',
+
+            description:
+                'List files and directories inside a directory.',
+
             parameters: {
                 type: 'object',
+
                 properties: {
-                    path: { type: 'string', description: 'Absolute or workspace-relative directory path' }
+                    path: {
+                        type: 'string',
+                        description:
+                            'Absolute or workspace-relative directory path'
+                    }
                 },
-                required: ['path']
+
+                required: [
+                    'path'
+                ]
             }
         }
     },
+
     {
         type: 'function',
+
         function: {
             name: 'run_terminal_command',
-            description: 'Run a shell command in the workspace root and return stdout/stderr.',
+
+            description:
+                'Run a shell command in the workspace root.',
+
             parameters: {
                 type: 'object',
+
                 properties: {
-                    command: { type: 'string', description: 'The shell command to run' }
+                    command: {
+                        type: 'string',
+                        description:
+                            'Shell command to execute'
+                    }
                 },
-                required: ['command']
+
+                required: [
+                    'command'
+                ]
             }
         }
     }
 ];
 
-// ------------------------------------------------------------
+// ============================================================
 // Provider
-// ------------------------------------------------------------
+// ============================================================
 
-class ChatViewProvider implements vscode.WebviewViewProvider {
+class ChatViewProvider
+    implements vscode.WebviewViewProvider {
 
-    public static readonly viewType = 'myAiCoder.chatView';
+    public static readonly viewType =
+        'myAiCoder.chatView';
 
-    private _view?: vscode.WebviewView;
-    private sessions: ChatSession[];
-    private currentSession: ChatSession;
+    private _view?:
+        vscode.WebviewView;
+
+    private sessions:
+        ChatSession[];
+
+    private currentSession:
+        ChatSession;
+
+    private agent:
+        AgentState = {
+            running:
+                false,
+
+            stopped:
+                false,
+
+            activities:
+                []
+        };
+
+    private activeProcesses:
+        Set<ChildProcess> =
+        new Set();
 
     constructor(
-        private readonly _extensionUri: vscode.Uri,
-        private readonly _context: vscode.ExtensionContext
+        private readonly _extensionUri:
+            vscode.Uri,
+
+        private readonly _context:
+            vscode.ExtensionContext
     ) {
-        this.sessions = this._context.globalState.get<ChatSession[]>(STORAGE_KEY, []);
-        this.currentSession = this.createSession();
+
+        this.sessions =
+            this._context.globalState.get<
+                ChatSession[]
+            >(
+                STORAGE_KEY,
+                []
+            );
+
+        this.currentSession =
+            this.createSession();
     }
 
+    // ========================================================
+    // Webview
+    // ========================================================
+
     public resolveWebviewView(
-        webviewView: vscode.WebviewView
-    ) {
-        this._view = webviewView;
+        webviewView:
+            vscode.WebviewView
+    ): void {
+
+        this._view =
+            webviewView;
 
         webviewView.webview.options = {
-            enableScripts: true,
+            enableScripts:
+                true,
+
             localResourceRoots: [
-                vscode.Uri.joinPath(this._extensionUri, 'media')
+                vscode.Uri.joinPath(
+                    this._extensionUri,
+                    'media'
+                )
             ]
         };
 
-        webviewView.webview.html = this.getHtml(webviewView.webview);
+        webviewView.webview.html =
+            this.getHtml(
+                webviewView.webview
+            );
 
-        webviewView.webview.onDidReceiveMessage(async (message) => {
-            switch (message.type) {
-                case 'sendMessage':
-                    await this.handleUserMessage(message.text);
-                    break;
-                case 'newChat':
-                    this.startNewChat();
-                    break;
+        webviewView.webview.onDidReceiveMessage(
+            async (
+                message
+            ) => {
+
+                switch (
+                    message.type
+                ) {
+
+                    case 'sendMessage':
+
+                        await this.handleUserMessage(
+                            String(
+                                message.text ||
+                                ''
+                            )
+                        );
+
+                        break;
+
+                    case 'stopAgent':
+
+                        this.stopAgent();
+
+                        break;
+
+                    case 'newChat':
+
+                        this.startNewChat();
+
+                        break;
+
+                    case 'showHistory':
+
+                        await this.showHistory();
+
+                        break;
+
+                    case 'requestState':
+
+                        this.sendFullState();
+
+                        break;
+                }
             }
+        );
+
+        this.sendFullState();
+    }
+
+    // ========================================================
+    // UI
+    // ========================================================
+
+    private post(
+        message:
+            any
+    ): void {
+
+        if (!this._view) {
+            return;
+        }
+
+        void this._view.webview.postMessage(
+            message
+        );
+    }
+
+    private addActivity(
+        data:
+            Omit<
+                ActivityItem,
+                'id' | 'timestamp'
+            >
+    ): ActivityItem {
+
+        const item:
+            ActivityItem = {
+                ...data,
+
+                id:
+                    randomUUID(),
+
+                timestamp:
+                    Date.now()
+            };
+
+        this.agent.activities.push(
+            item
+        );
+
+        this.post({
+            type:
+                'activity',
+
+            activity:
+                item
+        });
+
+        return item;
+    }
+
+    private updateActivity(
+        id:
+            string,
+
+        update:
+            Partial<ActivityItem>
+    ): void {
+
+        const index =
+            this.agent.activities.findIndex(
+                item =>
+                    item.id === id
+            );
+
+        if (index === -1) {
+            return;
+        }
+
+        this.agent.activities[index] = {
+            ...this.agent.activities[index],
+            ...update
+        };
+
+        this.post({
+            type:
+                'activityUpdate',
+
+            activity:
+                this.agent.activities[index]
         });
     }
 
-    // ------------------------------------------------------------
-    // Session management
-    // ------------------------------------------------------------
+    private sendFullState(): void {
 
-    private createSession(): ChatSession {
+        const messages =
+            this.currentSession.messages.filter(
+                message => {
+
+                    if (
+                        message.role ===
+                        'user'
+                    ) {
+                        return true;
+                    }
+
+                    if (
+                        message.role ===
+                        'assistant'
+                    ) {
+                        return (
+                            message.content !==
+                            null &&
+                            message.content !==
+                            ''
+                        );
+                    }
+
+                    return false;
+                }
+            );
+
+        this.post({
+            type:
+                'state',
+
+            running:
+                this.agent.running,
+
+            stopped:
+                this.agent.stopped,
+
+            activities:
+                this.agent.activities,
+
+            messages:
+                messages
+        });
+    }
+
+    // ========================================================
+    // Sessions
+    // ========================================================
+
+    private createSession():
+        ChatSession {
+
         return {
-            id: randomUUID(),
-            title: 'New Chat',
-            messages: [],
-            updatedAt: Date.now()
+            id:
+                randomUUID(),
+
+            title:
+                'New Chat',
+
+            messages:
+                [],
+
+            updatedAt:
+                Date.now()
         };
     }
 
-    private saveSessions() {
-        this._context.globalState.update(STORAGE_KEY, this.sessions);
+    private saveSessions():
+        void {
+
+        void this._context.globalState.update(
+            STORAGE_KEY,
+            this.sessions
+        );
     }
 
-    private persistCurrentSession() {
-        if (this.currentSession.messages.length === 0) {
+    private persistCurrentSession():
+        void {
+
+        if (
+            this.currentSession.messages.length ===
+            0
+        ) {
             return;
         }
 
-        const existingIndex = this.sessions.findIndex(
-            (s) => s.id === this.currentSession.id
-        );
+        const index =
+            this.sessions.findIndex(
+                session =>
+                    session.id ===
+                    this.currentSession.id
+            );
 
-        if (existingIndex >= 0) {
-            this.sessions[existingIndex] = this.currentSession;
+        if (index >= 0) {
+
+            this.sessions[index] =
+                this.currentSession;
+
         } else {
-            this.sessions.unshift(this.currentSession);
+
+            this.sessions.unshift(
+                this.currentSession
+            );
         }
 
-        this.sessions.sort((a, b) => b.updatedAt - a.updatedAt);
+        this.sessions.sort(
+            (
+                a,
+                b
+            ) =>
+                b.updatedAt -
+                a.updatedAt
+        );
+
         this.saveSessions();
     }
 
-    public startNewChat() {
-        this.persistCurrentSession();
-        this.currentSession = this.createSession();
-        this._view?.webview.postMessage({ type: 'cleared' });
-    }
+    public startNewChat():
+        void {
 
-    public async showHistory() {
-        this.persistCurrentSession();
-
-        if (this.sessions.length === 0) {
-            vscode.window.showInformationMessage('No past conversations yet.');
+        if (
+            this.agent.running
+        ) {
             return;
         }
 
-        const items = this.sessions.map((s) => ({
-            label: s.title,
-            description: new Date(s.updatedAt).toLocaleString(),
-            id: s.id
-        }));
+        this.persistCurrentSession();
 
-        const picked = await vscode.window.showQuickPick(items, {
-            placeHolder: 'Select a past conversation to reopen'
-        });
+        this.currentSession =
+            this.createSession();
 
-        if (picked) {
-            this.loadSession(picked.id);
-        }
+        this.agent = {
+            running:
+                false,
+
+            stopped:
+                false,
+
+            activities:
+                []
+        };
+
+        this.sendFullState();
     }
 
-    private loadSession(id: string) {
-        const session = this.sessions.find((s) => s.id === id);
+    public async showHistory():
+        Promise<void> {
+
+        if (
+            this.agent.running
+        ) {
+            return;
+        }
+
+        this.persistCurrentSession();
+
+        if (
+            this.sessions.length ===
+            0
+        ) {
+
+            await vscode.window.showInformationMessage(
+                'No past conversations yet.'
+            );
+
+            return;
+        }
+
+        const items =
+            this.sessions.map(
+                session => ({
+                    label:
+                        session.title,
+
+                    description:
+                        new Date(
+                            session.updatedAt
+                        ).toLocaleString(),
+
+                    id:
+                        session.id
+                })
+            );
+
+        const selected =
+            await vscode.window.showQuickPick(
+                items,
+                {
+                    placeHolder:
+                        'Select a past conversation'
+                }
+            );
+
+        if (!selected) {
+            return;
+        }
+
+        const session =
+            this.sessions.find(
+                item =>
+                    item.id ===
+                    selected.id
+            );
+
         if (!session) {
             return;
         }
 
-        this.persistCurrentSession();
-        this.currentSession = session;
+        this.currentSession =
+            session;
 
-        this._view?.webview.postMessage({
-            type: 'restore',
-            // Only replay real text turns as bubbles; tool plumbing stays out of the UI history
-            messages: this.currentSession.messages.filter(
-                (m) => (m.role === 'user' || m.role === 'assistant') && m.content
-            )
-        });
+        this.sendFullState();
     }
 
-    // ------------------------------------------------------------
-    // Workspace helpers
-    // ------------------------------------------------------------
+    // ========================================================
+    // Workspace
+    // ========================================================
 
-    private resolvePath(inputPath: string): string {
-        if (path.isAbsolute(inputPath)) {
-            return inputPath;
+    private getWorkspaceRoot():
+        string {
+
+        const folders =
+            vscode.workspace.workspaceFolders;
+
+        if (
+            folders &&
+            folders.length >
+            0
+        ) {
+
+            return folders[0]
+                .uri
+                .fsPath;
         }
 
-        const folders = vscode.workspace.workspaceFolders;
-        const root = folders && folders.length > 0
-            ? folders[0].uri.fsPath
-            : process.cwd();
-
-        return path.join(root, inputPath);
+        return process.cwd();
     }
 
-    private getWorkspaceRoot(): string {
-        const folders = vscode.workspace.workspaceFolders;
-        return folders && folders.length > 0
-            ? folders[0].uri.fsPath
-            : process.cwd();
+    private resolvePath(
+        value:
+            string
+    ):
+        string {
+
+        if (
+            path.isAbsolute(
+                value
+            )
+        ) {
+
+            return path.normalize(
+                value
+            );
+        }
+
+        return path.normalize(
+            path.join(
+                this.getWorkspaceRoot(),
+                value
+            )
+        );
     }
 
-    private async confirmAction(message: string): Promise<boolean> {
-        const autoApprove = vscode.workspace
-            .getConfiguration('myAiCoder')
-            .get<boolean>('autoApprove', false);
+    // ========================================================
+    // Permission
+    // ========================================================
 
-        if (autoApprove) {
+    private async confirmAction(
+        message:
+            string
+    ):
+        Promise<boolean> {
+
+        const autoApprove =
+            vscode.workspace
+                .getConfiguration(
+                    'myAiCoder'
+                )
+                .get<boolean>(
+                    'autoApprove',
+                    false
+                );
+
+        if (
+            autoApprove
+        ) {
             return true;
         }
 
-        const choice = await vscode.window.showWarningMessage(
-            message,
-            { modal: true },
-            'Allow',
-            'Deny'
+        const answer =
+            await vscode.window.showWarningMessage(
+                message,
+                {
+                    modal:
+                        true
+                },
+
+                'Allow',
+                'Deny'
+            );
+
+        return (
+            answer ===
+            'Allow'
+        );
+    }
+
+    // ========================================================
+    // Write file
+    // ========================================================
+
+    private async writeFileLive(
+        fullPath:
+            string,
+
+        content:
+            string
+    ):
+        Promise<void> {
+
+        await fs.mkdir(
+            path.dirname(
+                fullPath
+            ),
+            {
+                recursive:
+                    true
+            }
         );
 
-        return choice === 'Allow';
-    }
+        const uri =
+            vscode.Uri.file(
+                fullPath
+            );
 
-    private truncate(text: string): string {
-        if (text.length <= MAX_TOOL_OUTPUT_CHARS) {
-            return text;
+        const openDocument =
+            vscode.workspace.textDocuments.find(
+                document =>
+                    document.uri.fsPath
+                        .toLowerCase() ===
+                    fullPath
+                        .toLowerCase()
+            );
+
+        if (
+            openDocument
+        ) {
+
+            const oldText =
+                openDocument.getText();
+
+            const fullRange =
+                new vscode.Range(
+                    openDocument.positionAt(
+                        0
+                    ),
+
+                    openDocument.positionAt(
+                        oldText.length
+                    )
+                );
+
+            const edit =
+                new vscode.WorkspaceEdit();
+
+            edit.replace(
+                uri,
+                fullRange,
+                content
+            );
+
+            await vscode.workspace.applyEdit(
+                edit
+            );
+
+            await openDocument.save();
+
+        } else {
+
+            await fs.writeFile(
+                fullPath,
+                content,
+                'utf8'
+            );
         }
-        return text.slice(0, MAX_TOOL_OUTPUT_CHARS) + '\n...[truncated]';
-    }
 
-    // ------------------------------------------------------------
-    // Tool execution
-    // ------------------------------------------------------------
+        this.post({
+            type:
+                'fileChanged',
 
-    private async executeTool(toolCall: ToolCall): Promise<string> {
-        const { name, arguments: argsJson } = toolCall.function;
-
-        let args: any;
-        try {
-            args = JSON.parse(argsJson || '{}');
-        } catch {
-            return 'Error: could not parse tool arguments as JSON.';
-        }
-
-        this._view?.webview.postMessage({
-            type: 'toolCall',
-            name,
-            args
+            path:
+                fullPath
         });
-
-        try {
-            switch (name) {
-
-                case 'read_file': {
-                    const fullPath = this.resolvePath(args.path);
-                    const content = await fs.readFile(fullPath, 'utf-8');
-                    return this.truncate(content);
-                }
-
-                case 'write_file': {
-                    const fullPath = this.resolvePath(args.path);
-
-                    const approved = await this.confirmAction(
-                        `Allow My AI Coder to write to:\n${fullPath}?`
-                    );
-
-                    if (!approved) {
-                        return 'The user denied permission to write this file.';
-                    }
-
-                    await fs.mkdir(path.dirname(fullPath), { recursive: true });
-                    await fs.writeFile(fullPath, args.content, 'utf-8');
-
-                    // Open/refresh the file in the editor so the user sees the change
-                    const doc = await vscode.workspace.openTextDocument(fullPath);
-                    await vscode.window.showTextDocument(doc, { preview: false });
-
-                    return `File written successfully: ${fullPath}`;
-                }
-
-                case 'list_directory': {
-                    const fullPath = this.resolvePath(args.path);
-                    const entries = await fs.readdir(fullPath, { withFileTypes: true });
-                    const listing = entries
-                        .map((e) => (e.isDirectory() ? `${e.name}/` : e.name))
-                        .join('\n');
-                    return listing || '(empty directory)';
-                }
-
-                case 'run_terminal_command': {
-                    const approved = await this.confirmAction(
-                        `Allow My AI Coder to run this command in the workspace?\n\n${args.command}`
-                    );
-
-                    if (!approved) {
-                        return 'The user denied permission to run this command.';
-                    }
-
-                    try {
-                        const { stdout, stderr } = await execAsync(args.command, {
-                            cwd: this.getWorkspaceRoot(),
-                            timeout: 30000,
-                            maxBuffer: 1024 * 1024
-                        });
-                        return this.truncate(
-                            `stdout:\n${stdout || '(empty)'}\n\nstderr:\n${stderr || '(empty)'}`
-                        );
-                    } catch (execError: any) {
-                        return this.truncate(
-                            `Command failed: ${execError.message}\n\nstdout:\n${execError.stdout || ''}\n\nstderr:\n${execError.stderr || ''}`
-                        );
-                    }
-                }
-
-                default:
-                    return `Error: unknown tool "${name}".`;
-            }
-        } catch (err) {
-            return `Error running tool "${name}": ${String(err)}`;
-        }
     }
 
-    // ------------------------------------------------------------
-    // Chat handling (agent loop)
-    // ------------------------------------------------------------
+    // ========================================================
+    // Terminal
+    // ========================================================
 
-    private async handleUserMessage(text: string) {
-        if (!text || !this._view) {
-            return;
+    private async runTerminal(
+        command:
+            string
+    ):
+        Promise<string> {
+
+        const approved =
+            await this.confirmAction(
+                `Allow My AI Coder to run this command?\n\n${command}`
+            );
+
+        if (!approved) {
+
+            return (
+                'The user denied permission to run this command.'
+            );
         }
 
-        this.currentSession.messages.push({ role: 'user', content: text });
-        this.currentSession.updatedAt = Date.now();
+        const activity =
+            this.addActivity({
+                type:
+                    'terminal',
 
-        if (this.currentSession.title === 'New Chat') {
-            this.currentSession.title = text.length > MAX_TITLE_LENGTH
-                ? text.slice(0, MAX_TITLE_LENGTH) + '...'
-                : text;
-        }
+                title:
+                    command,
 
-        this._view.webview.postMessage({ type: 'userMessage', text });
-        this._view.webview.postMessage({ type: 'thinking' });
+                detail:
+                    'Running...',
 
-        try {
-            let rounds = 0;
+                status:
+                    'running',
 
-            while (rounds < MAX_TOOL_ROUNDS) {
-                rounds++;
+                toolName:
+                    'run_terminal_command'
+            });
 
-                const response = await axios.post(
-                    'http://127.0.0.1:8000/chat',
-                    {
-                        messages: this.currentSession.messages,
-                        tools: TOOLS
+        return new Promise(
+            resolve => {
+
+                const shell =
+                    process.platform ===
+                    'win32'
+                        ? 'cmd.exe'
+                        : '/bin/sh';
+
+                const args =
+                    process.platform ===
+                    'win32'
+                        ? [
+                            '/d',
+                            '/s',
+                            '/c',
+                            command
+                        ]
+                        : [
+                            '-c',
+                            command
+                        ];
+
+                const child =
+                    spawn(
+                        shell,
+                        args,
+                        {
+                            cwd:
+                                this.getWorkspaceRoot(),
+
+                            env:
+                                process.env,
+
+                            windowsHide:
+                                true
+                        }
+                    );
+
+                this.activeProcesses.add(
+                    child
+                );
+
+                let output =
+                    '';
+
+                const onData =
+                    (
+                        chunk:
+                            Buffer | string
+                    ) => {
+
+                        const text =
+                            chunk.toString();
+
+                        output +=
+                            text;
+
+                        this.post({
+                            type:
+                                'terminalOutput',
+
+                            activityId:
+                                activity.id,
+
+                            text:
+                                text
+                        });
+
+                        this.updateActivity(
+                            activity.id,
+                            {
+                                detail:
+                                    output
+                            }
+                        );
+                    };
+
+                child.stdout?.on(
+                    'data',
+                    onData
+                );
+
+                child.stderr?.on(
+                    'data',
+                    onData
+                );
+
+                child.on(
+                    'error',
+                    error => {
+
+                        output +=
+                            `\n${error.message}`;
+
+                        this.updateActivity(
+                            activity.id,
+                            {
+                                status:
+                                    'failed',
+
+                                detail:
+                                    output
+                            }
+                        );
+
+                        this.activeProcesses.delete(
+                            child
+                        );
+
+                        resolve(
+                            output
+                        );
                     }
                 );
 
-                const message = response.data.message as ChatMessage;
+                child.on(
+                    'close',
+                    code => {
 
-                if (message.tool_calls && message.tool_calls.length > 0) {
-                    // Record the assistant's tool-call turn
-                    this.currentSession.messages.push({
-                        role: 'assistant',
-                        content: message.content ?? null,
-                        tool_calls: message.tool_calls
-                    });
+                        const result =
+                            output +
+                            `\n\nProcess exited with code ${
+                                code ?? 0
+                            }.`;
 
-                    // Execute each requested tool and feed results back
-                    for (const toolCall of message.tool_calls) {
-                        const result = await this.executeTool(toolCall);
+                        this.updateActivity(
+                            activity.id,
+                            {
+                                status:
+                                    code ===
+                                    0
+                                        ? 'completed'
+                                        : 'failed',
 
-                        this.currentSession.messages.push({
-                            role: 'tool',
-                            tool_call_id: toolCall.id,
-                            content: result
-                        });
+                                detail:
+                                    result
+                            }
+                        );
 
-                        this._view.webview.postMessage({
-                            type: 'toolResult',
-                            name: toolCall.function.name,
+                        this.activeProcesses.delete(
+                            child
+                        );
+
+                        resolve(
                             result
-                        });
+                        );
                     }
-
-                    // Loop again so the model can react to the tool results
-                    continue;
-                }
-
-                // Final plain-text answer
-                const answer = message.content ?? '';
-                this.currentSession.messages.push({ role: 'assistant', content: answer });
-                this.currentSession.updatedAt = Date.now();
-
-                this._view.webview.postMessage({
-                    type: 'assistantMessage',
-                    text: answer
-                });
-
-                this.persistCurrentSession();
-                return;
+                );
             }
+        );
+    }
 
-            this._view.webview.postMessage({
-                type: 'error',
-                text: 'Stopped after too many tool-call rounds.'
+    // ========================================================
+    // Tools
+    // ========================================================
+
+    private async executeTool(
+        call:
+            ToolCall
+    ):
+        Promise<string> {
+
+        let args:
+            any;
+
+        try {
+
+            args =
+                JSON.parse(
+                    call.function.arguments ||
+                    '{}'
+                );
+
+        } catch (
+            error
+        ) {
+
+            return (
+                `Invalid JSON arguments: ${String(error)}`
+            );
+        }
+
+        const activity =
+            this.addActivity({
+                type:
+                    'tool',
+
+                title:
+                    call.function.name,
+
+                detail:
+                    JSON.stringify(
+                        args,
+                        null,
+                        2
+                    ),
+
+                status:
+                    'running',
+
+                toolName:
+                    call.function.name,
+
+                args:
+                    args
             });
 
-        } catch (error) {
-            let errorText: string;
-            if (axios.isAxiosError(error)) {
-                errorText = error.response?.data?.detail || error.message;
-            } else {
-                errorText = String(error);
+        try {
+
+            switch (
+                call.function.name
+            ) {
+
+                case 'read_file': {
+
+                    const fullPath =
+                        this.resolvePath(
+                            String(
+                                args.path
+                            )
+                        );
+
+                    const content =
+                        await fs.readFile(
+                            fullPath,
+                            'utf8'
+                        );
+
+                    this.updateActivity(
+                        activity.id,
+                        {
+                            status:
+                                'completed',
+
+                            detail:
+                                fullPath
+                        }
+                    );
+
+                    return content;
+                }
+
+                case 'write_file': {
+
+                    const fullPath =
+                        this.resolvePath(
+                            String(
+                                args.path
+                            )
+                        );
+
+                    const approved =
+                        await this.confirmAction(
+                            `Allow My AI Coder to write:\n${fullPath}?`
+                        );
+
+                    if (
+                        !approved
+                    ) {
+
+                        this.updateActivity(
+                            activity.id,
+                            {
+                                status:
+                                    'failed',
+
+                                detail:
+                                    'Permission denied.'
+                            }
+                        );
+
+                        return (
+                            'The user denied permission to write this file.'
+                        );
+                    }
+
+                    await this.writeFileLive(
+                        fullPath,
+
+                        String(
+                            args.content ??
+                            ''
+                        )
+                    );
+
+                    this.updateActivity(
+                        activity.id,
+                        {
+                            title:
+                                `Updated ${args.path}`,
+
+                            status:
+                                'completed',
+
+                            detail:
+                                fullPath
+                        }
+                    );
+
+                    return (
+                        `File written successfully: ${fullPath}`
+                    );
+                }
+
+                case 'list_directory': {
+
+                    const fullPath =
+                        this.resolvePath(
+                            String(
+                                args.path
+                            )
+                        );
+
+                    const entries =
+                        await fs.readdir(
+                            fullPath,
+                            {
+                                withFileTypes:
+                                    true
+                            }
+                        );
+
+                    const listing =
+                        entries
+                            .map(
+                                entry =>
+                                    entry.isDirectory()
+                                        ? `${entry.name}/`
+                                        : entry.name
+                            )
+                            .join('\n');
+
+                    this.updateActivity(
+                        activity.id,
+                        {
+                            status:
+                                'completed',
+
+                            detail:
+                                listing
+                        }
+                    );
+
+                    return (
+                        listing ||
+                        '(empty directory)'
+                    );
+                }
+
+                case 'run_terminal_command': {
+
+                    const result =
+                        await this.runTerminal(
+                            String(
+                                args.command ??
+                                ''
+                            )
+                        );
+
+                    this.updateActivity(
+                        activity.id,
+                        {
+                            status:
+                                'completed',
+
+                            detail:
+                                result
+                        }
+                    );
+
+                    return result;
+                }
+
+                default: {
+
+                    const result =
+                        `Unknown tool: ${call.function.name}`;
+
+                    this.updateActivity(
+                        activity.id,
+                        {
+                            status:
+                                'failed',
+
+                            detail:
+                                result
+                        }
+                    );
+
+                    return result;
+                }
             }
 
-            this._view.webview.postMessage({
-                type: 'error',
-                text: errorText
+        } catch (
+            error
+        ) {
+
+            const result =
+                `Tool failed: ${String(error)}`;
+
+            this.updateActivity(
+                activity.id,
+                {
+                    status:
+                        'failed',
+
+                    detail:
+                        result
+                }
+            );
+
+            return result;
+        }
+    }
+
+    // ========================================================
+    // Stop
+    // ========================================================
+
+    public stopAgent():
+        void {
+
+        if (
+            !this.agent.running
+        ) {
+            return;
+        }
+
+        this.agent.stopped =
+            true;
+
+        for (
+            const child
+            of this.activeProcesses
+        ) {
+
+            try {
+                child.kill();
+            } catch {
+                // Already closed.
+            }
+        }
+
+        this.activeProcesses.clear();
+
+        this.agent.running =
+            false;
+
+        this.addActivity({
+            type:
+                'status',
+
+            title:
+                'Stopped',
+
+            detail:
+                'Agent stopped by user.',
+
+            status:
+                'info'
+        });
+
+        this.post({
+            type:
+                'agentStopped'
+        });
+    }
+
+    // ========================================================
+    // User message
+    // ========================================================
+
+    private async handleUserMessage(
+        text:
+            string
+    ):
+        Promise<void> {
+
+        const value =
+            text.trim();
+
+        if (
+            !value
+        ) {
+            return;
+        }
+
+        if (
+            this.agent.running
+        ) {
+            return;
+        }
+
+        this.currentSession.messages.push({
+            role:
+                'user',
+
+            content:
+                value
+        });
+
+        this.currentSession.updatedAt =
+            Date.now();
+
+        if (
+            this.currentSession.title ===
+            'New Chat'
+        ) {
+
+            this.currentSession.title =
+                value.length >
+                50
+                    ? value.slice(
+                        0,
+                        50
+                    ) + '...'
+                    : value;
+        }
+
+        this.agent = {
+            running:
+                true,
+
+            stopped:
+                false,
+
+            activities:
+                []
+        };
+
+        this.persistCurrentSession();
+
+        this.post({
+            type:
+                'userMessage',
+
+            text:
+                value
+        });
+
+        this.post({
+            type:
+                'agentStarted'
+        });
+
+        try {
+
+            await this.runAgent();
+
+        } catch (
+            error
+        ) {
+
+            const text =
+                String(error);
+
+            this.agent.running =
+                false;
+
+            this.addActivity({
+                type:
+                    'error',
+
+                title:
+                    'Agent error',
+
+                detail:
+                    text,
+
+                status:
+                    'failed'
+            });
+
+            this.post({
+                type:
+                    'error',
+
+                text:
+                    text
             });
         }
     }
 
-    // ------------------------------------------------------------
-    // Webview HTML
-    // ------------------------------------------------------------
+    // ========================================================
+    // Agent loop
+    // ========================================================
 
-    private getHtml(webview: vscode.Webview): string {
-        const scriptUri = webview.asWebviewUri(
-            vscode.Uri.joinPath(this._extensionUri, 'media', 'main.js')
-        );
-        const styleUri = webview.asWebviewUri(
-            vscode.Uri.joinPath(this._extensionUri, 'media', 'main.css')
-        );
+    private async runAgent():
+        Promise<void> {
 
-        const nonce = getNonce();
+        while (
+            this.agent.running &&
+            !this.agent.stopped
+        ) {
 
-        return /* html */ `
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <meta charset="UTF-8">
-                <meta http-equiv="Content-Security-Policy"
-                    content="default-src 'none';
-                             style-src ${webview.cspSource};
-                             img-src ${webview.cspSource} https: data:;
-                             script-src 'nonce-${nonce}';">
-                <link href="${styleUri}" rel="stylesheet">
-                <title>My AI Coder</title>
-            </head>
-            <body>
-                <div id="chat"></div>
+            console.log(
+                '[My AI Coder] Sending model request...'
+            );
 
-                <div id="input-area">
-                    <textarea id="input" rows="1" placeholder="Ask My AI Coder..."></textarea>
-                    <button id="send">Send</button>
-                </div>
+            const response =
+                await axios.post(
+                    API_URL,
+                    {
+                        messages:
+                            this.currentSession.messages,
 
-                <script nonce="${nonce}" src="${scriptUri}"></script>
-            </body>
-            </html>
-        `;
+                        tools:
+                            TOOLS,
+
+                        model:
+                            undefined
+                    },
+                    {
+                        timeout:
+                            0,
+
+                        validateStatus:
+                            () => true
+                    }
+                );
+
+            // ------------------------------------------------
+            // HTTP error
+            // ------------------------------------------------
+
+            if (
+                response.status < 200 ||
+                response.status >= 300
+            ) {
+
+                const detail =
+                    response.data?.detail ||
+                    `HTTP ${response.status}`;
+
+                throw new Error(
+                    detail
+                );
+            }
+
+            const message =
+                response.data?.message;
+
+            if (
+                !message
+            ) {
+
+                throw new Error(
+                    'The server returned no assistant message.'
+                );
+            }
+
+            console.log(
+                '[My AI Coder] Model response received:',
+                {
+                    hasContent:
+                        message.content !==
+                        undefined,
+
+                    toolCalls:
+                        message.tool_calls?.length ||
+                        0
+                }
+            );
+
+            // ------------------------------------------------
+            // Tool calls
+            // ------------------------------------------------
+
+            if (
+                Array.isArray(
+                    message.tool_calls
+                ) &&
+                message.tool_calls.length >
+                0
+            ) {
+
+                /*
+                 * Persist assistant tool-call message FIRST.
+                 */
+
+                this.currentSession.messages.push({
+                    role:
+                        'assistant',
+
+                    content:
+                        message.content ??
+                        null,
+
+                    tool_calls:
+                        message.tool_calls
+                });
+
+                this.persistCurrentSession();
+
+                /*
+                 * Execute EVERY tool call.
+                 */
+
+                for (
+                    const call
+                    of message.tool_calls
+                ) {
+
+                    let result:
+                        string;
+
+                    if (
+                        this.agent.stopped
+                    ) {
+
+                        result =
+                            'Agent stopped by user.';
+
+                    } else {
+
+                        result =
+                            await this.executeTool(
+                                call
+                            );
+                    }
+
+                    /*
+                     * ALWAYS add the matching tool result.
+                     */
+
+                    this.currentSession.messages.push({
+                        role:
+                            'tool',
+
+                        tool_call_id:
+                            call.id,
+
+                        content:
+                            result
+                    });
+
+                    this.currentSession.updatedAt =
+                        Date.now();
+
+                    this.persistCurrentSession();
+                }
+
+                if (
+                    this.agent.stopped
+                ) {
+
+                    return;
+                }
+
+                /*
+                 * Continue with next model request.
+                 */
+
+                continue;
+            }
+
+            // ------------------------------------------------
+            // Final response
+            // ------------------------------------------------
+
+            const answer =
+                typeof message.content ===
+                'string'
+                    ? message.content
+                    : '';
+
+            this.currentSession.messages.push({
+                role:
+                    'assistant',
+
+                content:
+                    answer
+            });
+
+            this.currentSession.updatedAt =
+                Date.now();
+
+            this.persistCurrentSession();
+
+            this.agent.running =
+                false;
+
+            this.addActivity({
+                type:
+                    'result',
+
+                title:
+                    'Completed',
+
+                detail:
+                    answer,
+
+                status:
+                    'completed'
+            });
+
+            this.post({
+                type:
+                    'assistantMessage',
+
+                text:
+                    answer
+            });
+
+            this.post({
+                type:
+                    'agentFinished'
+            });
+
+            return;
+        }
+    }
+
+    // ========================================================
+    // HTML
+    // ========================================================
+
+    private getHtml(
+        webview:
+            vscode.Webview
+    ):
+        string {
+
+        const scriptUri =
+            webview.asWebviewUri(
+                vscode.Uri.joinPath(
+                    this._extensionUri,
+                    'media',
+                    'main.js'
+                )
+            );
+
+        const styleUri =
+            webview.asWebviewUri(
+                vscode.Uri.joinPath(
+                    this._extensionUri,
+                    'media',
+                    'main.css'
+                )
+            );
+
+        const nonce =
+            getNonce();
+
+        return `
+<!DOCTYPE html>
+
+<html lang="en">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta
+        http-equiv="Content-Security-Policy"
+        content="
+            default-src 'none';
+            style-src ${webview.cspSource};
+            script-src 'nonce-${nonce}';
+        "
+    >
+
+    <link
+        href="${styleUri}"
+        rel="stylesheet"
+    >
+
+    <title>
+        My AI Coder
+    </title>
+
+</head>
+
+<body>
+
+    <header id="header">
+
+        <div id="title">
+            My AI Coder
+        </div>
+
+        <div id="header-actions">
+
+            <button
+                id="new-chat"
+            >
+                +
+            </button>
+
+            <button
+                id="history"
+            >
+                History
+            </button>
+
+        </div>
+
+    </header>
+
+    <main id="chat"></main>
+
+    <section
+        id="activity-section"
+    >
+
+        <div
+            id="activity-header"
+            class="hidden"
+        >
+
+            <span
+                id="activity-status"
+            >
+                Working...
+            </span>
+
+            <button
+                id="stop"
+            >
+                Stop
+            </button>
+
+        </div>
+
+        <div
+            id="activity"
+        ></div>
+
+    </section>
+
+    <footer
+        id="input-area"
+    >
+
+        <textarea
+            id="input"
+            rows="1"
+            placeholder="Ask My AI Coder..."
+        ></textarea>
+
+        <button
+            id="send"
+        >
+            Send
+        </button>
+
+    </footer>
+
+    <script
+        nonce="${nonce}"
+        src="${scriptUri}"
+    ></script>
+
+</body>
+
+</html>
+`;
     }
 }
 
-function getNonce(): string {
-    let text = '';
+// ============================================================
+// Nonce
+// ============================================================
+
+function getNonce():
+    string {
+
+    let text =
+        '';
+
     const possible =
         'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-    for (let i = 0; i < 32; i++) {
-        text += possible.charAt(Math.floor(Math.random() * possible.length));
+
+    for (
+        let i = 0;
+        i < 32;
+        i++
+    ) {
+
+        text +=
+            possible.charAt(
+                Math.floor(
+                    Math.random() *
+                    possible.length
+                )
+            );
     }
+
     return text;
 }
 
-export function activate(context: vscode.ExtensionContext) {
+// ============================================================
+// Activate
+// ============================================================
 
-    const provider = new ChatViewProvider(context.extensionUri, context);
+export function activate(
+    context:
+        vscode.ExtensionContext
+):
+    void {
+
+    const provider =
+        new ChatViewProvider(
+            context.extensionUri,
+            context
+        );
 
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(
             ChatViewProvider.viewType,
-            provider
+            provider,
+            {
+                webviewOptions: {
+                    retainContextWhenHidden:
+                        true
+                }
+            }
         )
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('my-ai-coder.newChat', () => {
-            provider.startNewChat();
-        })
+        vscode.commands.registerCommand(
+            'my-ai-coder.newChat',
+            () => {
+                provider.startNewChat();
+            }
+        )
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('my-ai-coder.showHistory', () => {
-            provider.showHistory();
-        })
+        vscode.commands.registerCommand(
+            'my-ai-coder.showHistory',
+            () => {
+                void provider.showHistory();
+            }
+        )
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand(
+            'my-ai-coder.stopAgent',
+            () => {
+                provider.stopAgent();
+            }
+        )
     );
 }
 
-export function deactivate() {}
+export function deactivate():
+    void {
+}

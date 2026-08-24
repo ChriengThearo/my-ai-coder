@@ -2,7 +2,7 @@
   "name": "my-ai-coder",
   "displayName": "My AI Coder",
   "description": "AI coding assistant for VS Code",
-  "version": "0.0.2",
+  "version": "0.0.5",
   "publisher": "my-ai-coder",
   "icon": "images/icon.png",
   "engines": {
@@ -13,7 +13,10 @@
   ],
   "main": "./out/extension.js",
   "activationEvents": [
-    "onView:myAiCoder.chatView"
+    "onView:myAiCoder.chatView",
+    "onCommand:my-ai-coder.newChat",
+    "onCommand:my-ai-coder.showHistory",
+    "onCommand:my-ai-coder.stopAgent"
   ],
   "contributes": {
     "viewsContainers": {
@@ -30,7 +33,8 @@
         {
           "type": "webview",
           "id": "myAiCoder.chatView",
-          "name": "Chat"
+          "name": "Chat",
+          "when": "true"
         }
       ]
     },
@@ -44,6 +48,11 @@
         "command": "my-ai-coder.showHistory",
         "title": "My AI Coder: Show History",
         "icon": "$(history)"
+      },
+      {
+        "command": "my-ai-coder.stopAgent",
+        "title": "My AI Coder: Stop Agent",
+        "icon": "$(stop-circle)"
       }
     ],
     "menus": {
@@ -57,6 +66,11 @@
           "command": "my-ai-coder.showHistory",
           "when": "view == myAiCoder.chatView",
           "group": "navigation@2"
+        },
+        {
+          "command": "my-ai-coder.stopAgent",
+          "when": "view == myAiCoder.chatView",
+          "group": "navigation@3"
         }
       ]
     },
@@ -66,7 +80,7 @@
         "myAiCoder.autoApprove": {
           "type": "boolean",
           "default": false,
-          "description": "Skip the confirmation prompt before the AI writes files or runs terminal commands. Off by default for safety."
+          "description": "Automatically approve file writes and terminal commands."
         }
       }
     }
@@ -95,17 +109,5 @@
   },
   "dependencies": {
     "axios": "^1.19.0"
-  },
-  
-"configuration": {
-  "title": "My AI Coder",
-  "properties": {
-    "myAiCoder.autoApprove": {
-      "type": "boolean",
-      "default": false,
-      "description": "Skip the confirmation prompt before the AI writes files or runs terminal commands. Off by default for safety."
-    }
   }
-}
-
 }
