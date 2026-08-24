@@ -105,8 +105,8 @@ interface AgentState {
 const STORAGE_KEY =
     'myAiCoder.sessions';
 
-const API_URL =
-    'http://127.0.0.1:8000/chat';
+const DEFAULT_API_BASE_URL =
+    'https://beneficial-endurance-production-0d5d.up.railway.app';
 
 // ============================================================
 // Tools
@@ -753,6 +753,33 @@ class ChatViewProvider
         return (
             answer ===
             'Allow'
+        );
+    }
+
+    private getChatApiUrl():
+        string {
+
+        const configuredBaseUrl =
+            vscode.workspace
+                .getConfiguration(
+                    'myAiCoder'
+                )
+                .get<string>(
+                    'apiBaseUrl',
+                    DEFAULT_API_BASE_URL
+                )
+                .trim();
+
+        const baseUrl =
+            configuredBaseUrl ||
+            DEFAULT_API_BASE_URL;
+
+        return (
+            baseUrl.replace(
+                /\/+$/,
+                ''
+            ) +
+            '/chat'
         );
     }
 
@@ -1486,7 +1513,7 @@ class ChatViewProvider
 
             const response =
                 await axios.post(
-                    API_URL,
+                    this.getChatApiUrl(),
                     {
                         messages:
                             this.currentSession.messages,

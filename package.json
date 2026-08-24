@@ -2,7 +2,7 @@
   "name": "my-ai-coder",
   "displayName": "My AI Coder",
   "description": "AI coding assistant for VS Code",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "publisher": "my-ai-coder",
   "icon": "images/icon.png",
   "engines": {
@@ -77,6 +77,11 @@
     "configuration": {
       "title": "My AI Coder",
       "properties": {
+        "myAiCoder.apiBaseUrl": {
+          "type": "string",
+          "default": "https://beneficial-endurance-production-0d5d.up.railway.app",
+          "description": "Backend API base URL for My AI Coder."
+        },
         "myAiCoder.autoApprove": {
           "type": "boolean",
           "default": false,
